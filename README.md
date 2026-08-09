@@ -1,6 +1,6 @@
 # KFZCode
 
-内网 AI 编程助手 — 基于 OpenAI 兼容 API（智谱 GLM / DeepSeek / DeepV4 等），支持 CLI 交互，后续扩展 Web。
+开源的 内网部署 AI 编程助手 — 基于 OpenAI 兼容 API（智谱 GLM / DeepSeek 等），支持 CLI 交互，后续扩展 Web。
 
 ## 架构
 
