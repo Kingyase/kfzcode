@@ -1,0 +1,14 @@
+# Windows reserved filename
+NUL
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime files
+.pid
+*.log
+
+# Node
+node_modules/

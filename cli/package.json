@@ -1,0 +1,29 @@
+{
+  "name": "kfzcode-cli",
+  "version": "0.1.0",
+  "description": "KFZCode CLI - 内网 AI 编程助手终端",
+  "main": "dist/index.js",
+  "bin": {
+    "kfzcode": "./dist/index.js",
+    "kc": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^12.0.0",
+    "marked": "^4.3.0",
+    "marked-terminal": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
