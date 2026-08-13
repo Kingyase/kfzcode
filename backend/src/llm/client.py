@@ -322,6 +322,10 @@ class DeepV4Client:
                 result["content"] = msg.content   # 纯文本字符串
         elif msg.role == "assistant" and not msg.tool_calls:
             result["content"] = ""
+        # reasoning_content: thinking 模式模型（如 deepseek-v4-pro / deepseek-reasoner）
+        # 要求把 assistant 消息的推理内容原样传回，否则下一轮请求会返回 400
+        if msg.reasoning_content:
+            result["reasoning_content"] = msg.reasoning_content
         # tool_calls
         if msg.tool_calls:
             result["tool_calls"] = msg.tool_calls

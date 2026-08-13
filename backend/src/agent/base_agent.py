@@ -1,10 +1,12 @@
-﻿"""Agent 基类 — 消息循环 + LLM 调用 + 工具执行"""
+"""Agent 基类 — 消息循环 + LLM 调用 + 工具执行"""
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from .messages import AgentRole, Message, MessageType
 from .message_bus import MessageBus, AgentTimeoutError
+from .task_context import TaskContext, USER_RESPONSE_TIMEOUT
 from ..llm.client import DeepV4Client
 from ..llm.types import LLMMessage, LLMResponse, ToolResult
 from ..tools.base import ToolRegistry
@@ -21,7 +23,10 @@ class BaseAgent(ABC):
         self.registry = registry
         self._task: asyncio.Task | None = None
         self._running = False
-        self.conversation_history: list[LLMMessage] = []
+        # 对话历史按 task_id 隔离（per-task 状态）
+        self._histories: dict[str, list[LLMMessage]] = {}
+        # 当前正在处理的任务 id（串行调度下同一时刻只有一个）
+        self._current_task_id: str = ""
 
     @property
     @abstractmethod
@@ -33,6 +38,19 @@ class BaseAgent(ABC):
     async def handle_message(self, msg: Message) -> None:
         """处理收到的消息"""
         ...
+
+    # ===== per-task 状态访问 =====
+    def _history(self, task_id: str = "") -> list[LLMMessage]:
+        """返回指定任务（默认当前任务）的对话历史。"""
+        tid = task_id or self._current_task_id
+        return self._histories.setdefault(tid, [])
+
+    def _task_context(self, task_id: str = "") -> TaskContext | None:
+        """返回指定任务（默认当前任务）的 TaskContext。"""
+        tid = task_id or self._current_task_id
+        if not tid:
+            return None
+        return self.bus.get_task_context(tid)
 
     async def start(self) -> None:
         """启动 Agent 的消息循环"""
@@ -54,6 +72,7 @@ class BaseAgent(ABC):
         while self._running:
             try:
                 msg = await self.bus.receive(self.role, timeout=1.0)
+                self._current_task_id = msg.task_id
                 await self.handle_message(msg)
             except AgentTimeoutError:
                 continue
@@ -69,15 +88,16 @@ class BaseAgent(ABC):
                 })
 
     async def call_llm(self, user_message: str, tools: list | None = None) -> LLMResponse:
-        """调用 DeepV4"""
-        self.conversation_history.append(LLMMessage(role="user", content=user_message))
+        """调用 DeepV4，并把结果追加到当前任务的对话历史。"""
+        history = self._history()
+        history.append(LLMMessage(role="user", content=user_message))
 
         all_messages = [
             LLMMessage(role="system", content=self.system_prompt)
-        ] + self.conversation_history
+        ] + history
 
         response = await self.llm.chat(all_messages, tools=tools, stream=True)
-        self.conversation_history.append(response.to_message())
+        history.append(response.to_message())
         return response
 
     async def execute_tool_loop(self, initial_response: LLMResponse,
@@ -85,57 +105,87 @@ class BaseAgent(ABC):
         """执行 tool-use 循环（含 ask_user 暂停和 require_confirm 前置检查）"""
         current_response = initial_response
         turns = 0
+        ctx = self._task_context()
 
         while current_response.tool_calls and turns < max_turns:
+            if ctx and ctx.is_cancelled():
+                break  # 任务被取消，终止工具循环
             turns += 1
             tool_results: list[ToolResult] = []
-            should_break = False
 
             for tc in current_response.tool_calls:
                 tool = self.registry.get(tc.name)
 
-                # ==== ask_user: 多 Agent 模式下发布事件、中止循环 ====
+                # ==== ask_user: 发布事件并等待用户回复（多 Agent 交互闭环） ====
                 if tc.name == "ask_user":
                     try:
                         args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else tc.arguments
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                    await self.bus.publish_event("ask_user", {
+                    await self.bus.publish_event("progress", {
+                        "phase": "ask_user",
                         "agent": self.role.value,
                         "question": args.get("question", ""),
                         "question_type": args.get("question_type", "text"),
                         "header": args.get("header", ""),
                         "options": args.get("options", []),
                         "multi_select": args.get("multi_select", False),
-                    })
+                    }, task_id=self._current_task_id)
+                    # 等待用户回复（阻塞直到 HTTP respond 或超时）
+                    reply = await ctx.wait_for_user_response(timeout=USER_RESPONSE_TIMEOUT) if ctx else {"status": "timeout"}
+                    if ctx and ctx.is_cancelled():
+                        return current_response  # 任务被取消，提前结束工具循环
+                    answer = reply.get("answer", "")
+                    if reply.get("status") == "timeout" or not answer:
+                        answer = "(用户未回复)"
                     result = ToolResult(
                         tool_call_id=tc.id, name=tc.name, success=True,
-                        output=f"[等待用户回复] {args.get('question', '')}",
+                        output=f"用户回复: {answer}",
                     )
                     result.tool_call_id = tc.id
                     result.name = tc.name
                     tool_results.append(result)
-                    self.conversation_history.append(result.to_message())
-                    should_break = True
-                    break  # 不再执行本轮后续工具调用
+                    self._history().append(result.to_message())
+                    continue  # 继续本轮后续工具调用
 
-                # ==== require_confirm: 在执行前检查（不是执行后） ====
+                # ==== require_confirm: 等待用户确认后决定是否执行（确认闭环） ====
                 if tool and tool.require_confirm:
-                    await self.bus.publish_event("need_confirm", {
+                    await self.bus.publish_event("progress", {
+                        "phase": "need_confirm",
                         "agent": self.role.value,
-                        "tool": tc.name,
+                        "name": tc.name,
                         "arguments": tc.arguments,
-                    })
-                    # 多 Agent 模式下无法真正暂停等待，跳过执行并记录
-                    result = ToolResult(
-                        tool_call_id=tc.id, name=tc.name, success=False,
-                        output="⏭ 需要用户确认（多 Agent 模式下自动跳过）",
-                        error="需要用户确认",
-                    )
+                    }, task_id=self._current_task_id)
+                    reply = await ctx.wait_for_user_response(timeout=USER_RESPONSE_TIMEOUT) if ctx else {"status": "timeout"}
+                    if ctx and ctx.is_cancelled():
+                        return current_response  # 任务被取消，提前结束工具循环
+                    approved = reply.get("approved", False)
+                    custom_message = reply.get("custom_message", "")
+                    if approved:
+                        # 用户确认，执行工具
+                        try:
+                            args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else tc.arguments
+                            result = await tool.execute(**args)
+                            result.tool_call_id = tc.id
+                            result.name = tc.name
+                            if custom_message:
+                                result.output = f"[用户备注: {custom_message}]\n{result.output}"
+                        except Exception as e:
+                            result = ToolResult(
+                                tool_call_id=tc.id, name=tc.name, success=False,
+                                output="", error=str(e)
+                            )
+                    else:
+                        # 用户拒绝，跳过执行
+                        result = ToolResult(
+                            tool_call_id=tc.id, name=tc.name, success=False,
+                            output="⏭ 用户拒绝执行",
+                            error="用户拒绝执行",
+                        )
                     result.tool_call_id = tc.id
                     result.name = tc.name
                     tool_results.append(result)
-                    self.conversation_history.append(result.to_message())
+                    self._history().append(result.to_message())
                     continue
 
                 if not tool:
@@ -146,6 +196,8 @@ class BaseAgent(ABC):
                 else:
                     try:
                         args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else tc.arguments
+                        # 回滚追踪：写文件前备份原内容、shell 命令标记
+                        self._track_rollback(tc.name, tool, args)
                         result = await tool.execute(**args)
                         result.tool_call_id = tc.id
                         result.name = tc.name
@@ -156,7 +208,7 @@ class BaseAgent(ABC):
                         )
 
                 tool_results.append(result)
-                self.conversation_history.append(result.to_message())
+                self._history().append(result.to_message())
 
             # 发送进度事件
             await self.bus.publish_event("tool_results", {
@@ -165,21 +217,52 @@ class BaseAgent(ABC):
                     {"name": r.name, "success": r.success, "output": r.output[:200]}
                     for r in tool_results
                 ],
-            })
-
-            if should_break:
-                break
+            }, task_id=self._current_task_id)
 
             # 继续 LLM 调用
-            all_messages = [LLMMessage(role="system", content=self.system_prompt)] + self.conversation_history
+            history = self._history()
+            all_messages = [LLMMessage(role="system", content=self.system_prompt)] + history
             current_response = await self.llm.chat(all_messages, tools=tools, stream=True)
-            self.conversation_history.append(current_response.to_message())
+            history.append(current_response.to_message())
 
         return current_response
 
-    def reset_context(self) -> None:
-        """重置对话上下文"""
-        self.conversation_history = []
+    def reset_context(self, task_id: str = "") -> None:
+        """重置对话上下文（指定任务或全部）。"""
+        if task_id:
+            self._histories.pop(task_id, None)
+        else:
+            self._histories.clear()
+
+    def _track_rollback(self, tool_name: str, tool, args: dict) -> None:
+        """工具执行前的回滚追踪（写文件备份原内容、shell 标记）。
+
+        由 execute_tool_loop 在调用工具前调用，配合 TaskContext 的回滚字段，
+        实现「取消时回滚当前任务的文件修改」。
+        """
+        ctx = self._task_context()
+        if not ctx:
+            return
+
+        if tool_name in ("write_file", "edit_file"):
+            file_path = args.get("file_path", "")
+            if not file_path:
+                return
+            path = Path(file_path)
+            if not path.is_absolute():
+                workspace_root = getattr(tool, "workspace_root", None) or Path.cwd()
+                path = workspace_root / path
+            path = path.resolve()
+            key = str(path)
+            if path.exists():
+                try:
+                    ctx.backup_file(key, path.read_bytes())
+                except Exception:
+                    pass
+            else:
+                ctx.mark_created(key)
+        elif tool_name == "execute_command":
+            ctx.mark_shell_used()
 
     async def send_result(self, original_msg: Message, result_data: dict) -> None:
         """发送任务结果"""

@@ -246,6 +246,7 @@ export class Terminal {
     this.writeln('  /session [id]  - 列出/切换会话');
     this.writeln('  /config        - 显示当前配置');
     this.writeln('  /profile <name>- 切换模型预设');
+    this.writeln('  /mode [single|multi] - 切换单/多 Agent 模式');
     this.writeln('  /doctor        - 系统诊断');
     this.writeln('  /exit 或 Ctrl+C- 退出');
     this.writeln(chalk.gray('  ─────────────────────────────────────────\n'));

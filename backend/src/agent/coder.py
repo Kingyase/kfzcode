@@ -51,19 +51,19 @@ class CoderAgent(BaseAgent):
         elif msg.type == MessageType.FIX_INSTRUCTION:
             await self._handle_fix_task(msg)
         elif msg.type == MessageType.CANCEL:
-            self.reset_context()
+            self.reset_context(msg.task_id)
 
     async def _handle_coding_task(self, msg: Message) -> None:
         """处理编码任务"""
         payload = CoderTaskPayload.from_dict(msg.payload)
-        self.reset_context()
+        self.reset_context(msg.task_id)
 
         await self.bus.publish_event("progress", {
             "agent": "coder",
             "status": "working",
             "task": payload.description,
             "iteration": msg.iteration,
-        })
+        }, task_id=msg.task_id)
 
         # 构建编码任务 prompt
         prompt = self._build_coding_prompt(payload)
@@ -95,7 +95,7 @@ class CoderAgent(BaseAgent):
             "status": "fixing",
             "issue_count": len(payload.issues_to_fix),
             "iteration": msg.iteration,
-        })
+        }, task_id=msg.task_id)
 
         prompt = self._build_fix_prompt(payload)
         tools = self.registry.get_definitions()
@@ -155,7 +155,7 @@ class CoderAgent(BaseAgent):
     def _collect_changes(self) -> list[dict]:
         """从对话历史中收集文件变更"""
         changes = []
-        for msg in self.conversation_history:
+        for msg in self._history():
             if msg.role == "tool" and msg.content:
                 content = msg.content
                 if "✓" in content and ("创建" in content or "覆盖" in content or "编辑" in content):
@@ -168,7 +168,7 @@ class CoderAgent(BaseAgent):
     def _collect_created(self) -> list[str]:
         """收集新创建的文件"""
         created = []
-        for msg in self.conversation_history:
+        for msg in self._history():
             if msg.role == "tool" and msg.content and "✓ 创建文件:" in msg.content:
                 created.append(msg.content.split("✓ 创建文件:")[-1].split("(")[0].strip())
         return created

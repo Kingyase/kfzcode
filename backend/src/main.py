@@ -248,12 +248,17 @@ async def chat_respond(request: Request):
         raise HTTPException(status_code=400, detail="session_id is required")
 
     runner = session_runners.get(session_id)
-    if not runner:
-        raise HTTPException(status_code=404, detail="Session not found")
+    if runner:
+        _touch_session(session_id)
+        runner.respond_user(response_data)
+        return JSONResponse({"status": "ok"})
 
-    _touch_session(session_id)
-    runner.respond_user(response_data)
-    return JSONResponse({"status": "ok"})
+    # 多 Agent 模式：唤醒指定任务中等待用户回复的 Agent
+    if engine:
+        engine.respond_user(session_id, response_data)
+        return JSONResponse({"status": "ok"})
+
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
 @app.post("/api/chat/cancel")
@@ -270,11 +275,16 @@ async def cancel_chat(request: Request):
         raise HTTPException(status_code=400, detail="session_id is required")
 
     runner = session_runners.get(session_id)
-    if not runner:
-        raise HTTPException(status_code=404, detail="Session not found")
+    if runner:
+        runner.cancel()
+        return JSONResponse({"status": "cancelled", "session_id": session_id})
 
-    runner.cancel()
-    return JSONResponse({"status": "cancelled", "session_id": session_id})
+    # 多 Agent 模式：取消指定任务
+    if engine:
+        engine.cancel_task(session_id)
+        return JSONResponse({"status": "cancelled", "session_id": session_id})
+
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
 @app.post("/api/chat/multi-agent")
@@ -291,26 +301,36 @@ async def chat_multi_agent(request: Request):
         raise HTTPException(status_code=400, detail="message is required")
 
     task_id = await engine.submit_task(message, session_id=session_id)
-    event_queue = engine.get_event_queue()
+    event_queue = engine.get_event_queue(task_id)
 
     async def event_stream():
         try:
             yield {"event": "start", "data": json.dumps({
                 "status": "started", "task_id": task_id, "mode": "multi-agent",
-                "session_id": session_id or task_id,
+                "session_id": task_id,
             })}
 
             # 转发进度事件到 SSE
             while True:
                 try:
                     event = await asyncio.wait_for(event_queue.get(), timeout=600.0)
-                    yield {"event": "progress", "data": json.dumps(event, ensure_ascii=False)}
-
-                    if event.get("phase") in ("task_complete", "ask_user"):
-                        break
                 except asyncio.TimeoutError:
                     yield {"event": "timeout", "data": json.dumps({"error": "任务超时"})}
                     break
+
+                # 根据 phase 分派 SSE 事件类型：终止事件用独立类型，其余作为 progress 转发
+                phase = event.get("phase")
+                if phase == "task_complete":
+                    yield {"event": "task_complete", "data": json.dumps(event, ensure_ascii=False)}
+                    break
+                elif phase == "ask_user":
+                    yield {"event": "ask_user", "data": json.dumps(event, ensure_ascii=False)}
+                    # 不 break：Agent 正在等待用户回复，回复后会发布后续事件，SSE 继续转发
+                elif phase == "need_confirm":
+                    yield {"event": "need_confirm", "data": json.dumps(event, ensure_ascii=False)}
+                    # 不 break：Agent 正在等待用户确认，确认后会发布后续事件，SSE 继续转发
+                else:
+                    yield {"event": "progress", "data": json.dumps(event, ensure_ascii=False)}
 
                 # 检查客户端是否已断开
                 try:

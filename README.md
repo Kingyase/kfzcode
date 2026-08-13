@@ -1,5 +1,7 @@
 # KFZCode
 
+> **当前项目版本：v1.0.1**
+
 开源的 内网部署 AI 编程助手 — 基于 OpenAI 兼容 API（智谱 GLM / DeepSeek 等），支持 CLI 交互，后续扩展 Web。
 
 ## 架构
@@ -19,6 +21,18 @@
 |------|----------|------|
 | 单 Agent | `/api/chat` | CLI 默认使用，`SingleAgentRunner` 直接处理 tool-use 循环 |
 | 多 Agent | `/api/chat/multi-agent` | Orchestrator 调度 Coder 编写代码，Tester 自动测试审查 |
+
+**模式切换：**
+
+```bash
+kfzcode --multi-agent    # 启动即多 Agent 模式
+kfzcode                  # 默认单 Agent 模式
+
+# 运行中切换（交互式会话内）
+/mode multi              # 切换到多 Agent
+/mode single             # 切回单 Agent
+/mode                    # 查看当前模式
+```
 
 **配置层级（优先级由高到低）：**
 
@@ -247,6 +261,9 @@ kfzcode --model GLM-5
 # 关闭所有安全确认（信任模式）
 kfzcode --auto-approve
 
+# 多 Agent 协同模式（Orchestrator + Coder + Tester）
+kfzcode --multi-agent
+
 # 管道输入
 cat error.log | kfzcode "分析这段错误"
 
@@ -261,9 +278,14 @@ kfzcode doctor
 | `/model` | 查看当前模型 |
 | `/model GLM-5` | 切换到 GLM-5（开启新会话） |
 | `/profile glm-5v` | 切换到 glm-5v 预设 |
+| `/mode multi` | 切换到多 Agent 模式（开启新会话） |
+| `/mode single` | 切回单 Agent 模式 |
+| `/session [id]` | 列出 / 切换历史会话 |
+| `/image <路径>` | 附加图片（视觉识别） |
 | `/help` | 查看帮助 |
 | `/exit` 或 `Ctrl+C` | 退出 |
-| 双击 `Ctrl+C` | 强制退出（任务执行中时） |
+| `Ctrl+C`（任务执行中） | 取消当前任务（单/多 Agent 均支持，并回滚文件修改） |
+| 双击 `Ctrl+C` | 强制退出 |
 
 ---
 
@@ -288,6 +310,7 @@ kfzcode/
 │       │   ├── coder.py            # 编码 Agent
 │       │   ├── reviewer.py         # 审查 Agent
 │       │   ├── message_bus.py      # 异步消息总线
+│       │   ├── task_context.py     # 任务上下文（per-task 状态 + 回滚追踪）
 │       │   ├── messages.py         # Agent 间通信协议
 │       │   ├── base_agent.py       # Agent 基类
 │       │   ├── context.py          # 上下文窗口管理
@@ -355,15 +378,34 @@ kfzcode/
 
 Orchestrator 调度 Coder + Tester，最多 3 轮自动修正：
 
-1. Orchestrator 拆解任务 → 派发给 Coder
-2. Coder 编写代码 → 通知 Orchestrator
-3. Orchestrator → 派发测试给 Tester
-4. Tester 运行测试 / lint → 反馈结果
-5. 测试通过 → 汇报用户 ✓
-6. 测试失败且未满 3 轮 → 回到步骤 1
-7. 测试失败已满 3 轮 → 与用户确认是否验收
+1. **任务分类**：先判断是否为编码任务，普通对话/问答直接回复，不进入编码流程
+2. Orchestrator 拆解任务 → 派发给 Coder
+3. Coder 编写代码 → 通知 Orchestrator
+4. Orchestrator → 派发测试给 Tester
+5. Tester 运行测试 / lint → 反馈结果
+6. 测试通过 → 汇报用户 ✓
+7. 测试失败且未满 3 轮 → 派发修复指令给 Coder
+8. 测试失败已满 3 轮 → 通过 ask_user 与用户确认（继续修复 / 验收 / 跳过）
 
 Agent 间通过**异步消息总线（MessageBus）**通信，支持请求-回复（Future）和发布-订阅。
+
+**多 Agent 增强能力：**
+
+| 能力 | 说明 |
+|------|------|
+| 任务分类 | `_classify_task` 区分「编码任务」与「普通对话」，闲聊不触发 Coder/Tester |
+| ask_user 闭环 | Coder/Tester/Orchestrator 提问后真正等待用户回复，回复后继续执行 |
+| need_confirm 闭环 | 工具需确认时等待用户批准，确认则执行、拒绝则跳过 |
+| 任务取消 | `/api/chat/cancel` 支持多 Agent，Ctrl+C 可中断任务 |
+| 取消回滚 | 取消/异常时回滚本任务的文件修改（文件备份 + git 兜底） |
+
+### 任务隔离（P0 + P1）
+
+多 Agent 模式按 `task_id` 隔离任务状态：
+
+- **事件过滤**：SSE 事件按 `task_id` 路由，多客户端不串台
+- **状态隔离**：取消标志、HITL 等待、对话历史均按任务独立（`TaskContext`）
+- **内存治理**：任务结束自动清理历史与备份，无泄漏
 
 ### 工具集
 

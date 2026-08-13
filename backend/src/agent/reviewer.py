@@ -65,21 +65,22 @@ class ReviewerAgent(BaseAgent):
 """
 
     async def handle_message(self, msg: Message) -> None:
-        if msg.type != MessageType.TASK_ASSIGN:
-            return
-
-        await self._handle_review_task(msg)
+        if msg.type == MessageType.TASK_ASSIGN:
+            await self._handle_review_task(msg)
+        elif msg.type == MessageType.CANCEL:
+            # 任务结束/取消：清理该任务的历史，避免内存泄漏
+            self.reset_context(msg.task_id)
 
     async def _handle_review_task(self, msg: Message) -> None:
         """处理审查任务"""
         payload = TestTaskPayload.from_dict(msg.payload)
-        self.reset_context()
+        self.reset_context(msg.task_id)
 
         await self.bus.publish_event("progress", {
             "agent": "tester",
             "status": "reviewing",
             "iteration": msg.iteration,
-        })
+        }, task_id=msg.task_id)
 
         all_issues: list[Issue] = []
 
@@ -120,7 +121,7 @@ class ReviewerAgent(BaseAgent):
             "status": "done",
             "passed": result.passed,
             "issue_count": len(all_issues),
-        })
+        }, task_id=msg.task_id)
 
         await self.send_result(msg, result.to_dict())
 
@@ -195,7 +196,7 @@ class ReviewerAgent(BaseAgent):
     def _collect_test_output(self) -> str:
         """从对话历史收集测试输出"""
         outputs = []
-        for msg in self.conversation_history:
+        for msg in self._history():
             if msg.role == "tool" and msg.content:
                 if any(cmd in msg.content for cmd in ["$ ", "pytest", "npm test", "go test"]):
                     outputs.append(msg.content[:1000])

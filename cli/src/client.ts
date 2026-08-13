@@ -176,10 +176,13 @@ export class KFZCodeClient extends EventEmitter {
           for (const block of events) {
             if (!block.trim()) continue;
 
+            let eventType = 'progress';
             let dataStr = '';
             for (const line of block.split('\n')) {
               const trimmed = line.trimEnd();
-              if (trimmed.startsWith('data: ')) {
+              if (trimmed.startsWith('event: ')) {
+                eventType = trimmed.slice(7).trim();
+              } else if (trimmed.startsWith('data: ')) {
                 dataStr = trimmed.slice(6);
               }
             }
@@ -187,7 +190,7 @@ export class KFZCodeClient extends EventEmitter {
             if (dataStr) {
               try {
                 const data = JSON.parse(dataStr);
-                this.emit('sse', { type: data.type || 'progress', data });
+                this.emit('sse', { type: eventType as SSEEventType, data });
               } catch {
                 // ignore
               }

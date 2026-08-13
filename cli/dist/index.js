@@ -76,6 +76,7 @@ async function interactiveMode(options) {
         serverId: null,
         workspace,
         pendingImages: options.images || [],
+        mode: options.multiAgent ? 'multi' : 'single',
     };
     // 启动时如有图片，提示用户
     if (sessionState.pendingImages.length > 0) {
@@ -329,8 +330,49 @@ async function interactiveMode(options) {
                         }
                     }
                     break;
+                case 'progress':
+                    // 多 Agent 模式的进度事件（analysis / iteration / fixing / agent 状态）
+                    {
+                        const p = event.data || {};
+                        const agent = p.agent ? chalk_1.default.cyan(`[${p.agent}]`) : '';
+                        if (p.phase === 'analysis') {
+                            terminal.systemMessage(`${agent} ${p.content || '正在分析任务...'}`);
+                        }
+                        else if (p.phase === 'iteration') {
+                            terminal.systemMessage(`${agent} 开始第 ${p.iteration}/${p.max} 轮迭代`);
+                        }
+                        else if (p.phase === 'fixing') {
+                            terminal.systemMessage(`${agent} 发现 ${(p.issues || []).length} 个问题，进入修复（第 ${p.iteration} 轮）`);
+                        }
+                        else if (p.status === 'dispatched') {
+                            terminal.systemMessage(`${agent} 已派发任务${p.iteration ? `（第 ${p.iteration} 轮）` : ''}`);
+                        }
+                        else if (p.status === 'working') {
+                            terminal.systemMessage(`${agent} 正在编码...`);
+                        }
+                        else if (p.status === 'fixing') {
+                            terminal.systemMessage(`${agent} 正在修复 ${p.issue_count || 0} 个问题...`);
+                        }
+                        else if (p.status === 'reviewing') {
+                            terminal.systemMessage(`${agent} 正在审查代码...`);
+                        }
+                        else if (p.status === 'done') {
+                            terminal.systemMessage(`${agent} 审查完成: ${p.passed ? chalk_1.default.green('✓ 通过') : chalk_1.default.red(`✗ ${p.issue_count || 0} 个问题`)}`);
+                        }
+                        else {
+                            terminal.systemMessage(JSON.stringify(p));
+                        }
+                    }
+                    break;
                 case 'task_complete':
-                    terminal.successMessage(event.data.summary || '任务完成');
+                    if (event.data.is_chat) {
+                        // 普通对话回复（多 Agent 模式下非编码任务），以正常消息展示，不带成功前缀
+                        const rendered = renderer.render(event.data.summary || '');
+                        terminal.writeln('\n' + rendered);
+                    }
+                    else {
+                        terminal.successMessage(event.data.summary || '任务完成');
+                    }
                     break;
                 case 'done':
                     if (event.data.status === 'cancelled') {
@@ -362,15 +404,26 @@ async function interactiveMode(options) {
             const imagesToSend = sessionState.pendingImages.length > 0 ? [...sessionState.pendingImages] : undefined;
             isRunning = true;
             lastInterruptTime = 0; // 新任务开始时重置双击计时
-            await client.chat({
-                message: input,
-                images: imagesToSend,
-                project_path: sessionState.workspace,
-                profile: options.profile,
-                model: options.model,
-                session_id: sessionState.serverId || sessionState.localId,
-                auto_approve: options.autoApprove || false,
-            });
+            if (sessionState.mode === 'multi') {
+                await client.chatMultiAgent({
+                    message: input,
+                    project_path: sessionState.workspace,
+                    profile: options.profile,
+                    model: options.model,
+                    session_id: sessionState.serverId || sessionState.localId,
+                });
+            }
+            else {
+                await client.chat({
+                    message: input,
+                    images: imagesToSend,
+                    project_path: sessionState.workspace,
+                    profile: options.profile,
+                    model: options.model,
+                    session_id: sessionState.serverId || sessionState.localId,
+                    auto_approve: options.autoApprove || false,
+                });
+            }
             // 发送后清空 pending 图片
             if (sessionState.pendingImages.length > 0) {
                 sessionState.pendingImages = [];
@@ -594,6 +647,14 @@ async function handleCommand(input, terminal, config, options, sessionState) {
             else {
                 // 有参数 — 切换模型（开启新会话）
                 const newModel = parts.slice(1).join(' ');
+                // 防御：拦截把「模式名」误当「模型名」的输入（/mode 与 /model 易混淆）
+                const modeKeywords = ['multi', 'single', 'multi-agent', 'single-agent'];
+                if (modeKeywords.includes(newModel.toLowerCase())) {
+                    terminal.writeln(chalk_1.default.yellow(`⚠ "${newModel}" 是 Agent 模式名，不是模型名`));
+                    terminal.writeln(chalk_1.default.gray('  切换多 Agent 模式请用: /mode multi'));
+                    terminal.writeln(chalk_1.default.gray('  切换单 Agent 模式请用: /mode single'));
+                    break;
+                }
                 // 检查是否匹配某个 profile 名
                 if (config.profiles[newModel]) {
                     options.profile = newModel;
@@ -610,6 +671,41 @@ async function handleCommand(input, terminal, config, options, sessionState) {
                 sessionState.localId = (0, crypto_1.randomUUID)();
                 terminal.writeln(chalk_1.default.gray('  ℹ 模型切换需要新会话，已自动创建新会话'));
                 terminal.writeln(chalk_1.default.gray(`  ℹ 新会话 ID: ${sessionState.localId.slice(0, 8)}...`));
+            }
+            break;
+        case 'mode':
+            {
+                const target = parts[1]?.toLowerCase();
+                if (!target) {
+                    terminal.writeln(chalk_1.default.cyan(`\n当前模式: ${sessionState.mode === 'multi' ? chalk_1.default.bold('多 Agent (multi)') : chalk_1.default.bold('单 Agent (single)')}`));
+                    terminal.writeln(chalk_1.default.gray('用法: /mode single | /mode multi'));
+                    terminal.writeln(chalk_1.default.gray('说明: 切换模式会开启新会话'));
+                }
+                else if (target === 'single' || target === 'single-agent') {
+                    if (sessionState.mode === 'single') {
+                        terminal.systemMessage('当前已是单 Agent 模式');
+                    }
+                    else {
+                        sessionState.mode = 'single';
+                        sessionState.serverId = null;
+                        sessionState.localId = (0, crypto_1.randomUUID)();
+                        terminal.successMessage('已切换到单 Agent 模式（已开启新会话）');
+                    }
+                }
+                else if (target === 'multi' || target === 'multi-agent') {
+                    if (sessionState.mode === 'multi') {
+                        terminal.systemMessage('当前已是多 Agent 模式');
+                    }
+                    else {
+                        sessionState.mode = 'multi';
+                        sessionState.serverId = null;
+                        sessionState.localId = (0, crypto_1.randomUUID)();
+                        terminal.successMessage('已切换到多 Agent 模式（已开启新会话）');
+                    }
+                }
+                else {
+                    terminal.errorMessage(`未知模式: ${target}，可用: single / multi`);
+                }
             }
             break;
         case 'doctor':
@@ -755,6 +851,7 @@ program
     .option('-m, --model <name>', '指定模型名')
     .option('--config <path>', '使用自定义配置文件')
     .option('--auto-approve', '跳过所有权限确认')
+    .option('--multi-agent', '使用多 Agent 协同模式（Orchestrator + Coder + Tester）')
     .option('--no-sandbox', '禁用沙箱')
     .option('--verbose', '输出调试信息')
     .action(async (options) => {

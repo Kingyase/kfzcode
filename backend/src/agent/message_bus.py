@@ -3,6 +3,7 @@ import asyncio
 from collections import defaultdict
 
 from .messages import Message, AgentRole
+from .task_context import TaskContext
 
 
 class AgentTimeoutError(asyncio.TimeoutError):
@@ -19,12 +20,33 @@ class MessageBus:
             AgentRole.CODER: asyncio.Queue(maxsize=200),
             AgentRole.TESTER: asyncio.Queue(maxsize=200),
         }
-        # 事件总线：用于进度通知等广播消息（CLI WebSocket 可订阅）
-        self._event_listeners: dict[str, list[asyncio.Queue]] = defaultdict(list)
+        # 事件总线：每个监听项为 (task_id, queue)。
+        # task_id 为空串表示"订阅所有任务"（向后兼容/全局事件）。
+        self._event_listeners: dict[str, list[tuple[str, asyncio.Queue]]] = defaultdict(list)
         # 请求-响应追踪
         self._pending_requests: dict[str, asyncio.Future] = {}
         self._pending_targets: dict[str, AgentRole] = {}
+        # 任务上下文（per-task 状态隔离）
+        self._tasks: dict[str, TaskContext] = {}
 
+    # ===== 任务上下文管理 =====
+    def register_task(self, task_id: str, session_id: str = "") -> TaskContext:
+        """注册一个新任务，返回其独立的 TaskContext。"""
+        ctx = TaskContext(task_id=task_id, session_id=session_id)
+        self._tasks[task_id] = ctx
+        return ctx
+
+    def get_task_context(self, task_id: str) -> TaskContext | None:
+        """按 task_id 获取任务上下文；不存在时返回 None。"""
+        return self._tasks.get(task_id)
+
+    def remove_task(self, task_id: str) -> None:
+        """移除任务上下文（任务结束后清理），并兜底释放备份内存。"""
+        ctx = self._tasks.pop(task_id, None)
+        if ctx:
+            ctx.clear_backups()
+
+    # ===== 消息传递 =====
     async def send(self, msg: Message) -> None:
         """发送消息到目标 Agent"""
         await self._queues[msg.to_agent].put(msg)
@@ -91,18 +113,29 @@ class MessageBus:
                 payload=dict(msg.payload),
             ))
 
-    async def publish_event(self, event_type: str, data: dict) -> None:
-        """发布事件，通知所有订阅者"""
-        for queue in self._event_listeners.get(event_type, []):
-            await queue.put(data)
+    # ===== 事件发布/订阅（带 task_id 过滤） =====
+    async def publish_event(self, event_type: str, data: dict, task_id: str = "") -> None:
+        """发布事件。
 
-    def subscribe(self, event_type: str) -> asyncio.Queue:
-        """订阅某类事件"""
+        task_id 为空串表示广播给所有订阅者（全局事件）；
+        非空时只发给订阅了相同 task_id 或订阅了"所有"（task_id=""）的队列。
+        """
+        for tid, queue in self._event_listeners.get(event_type, []):
+            if not task_id or not tid or tid == task_id:
+                await queue.put(data)
+
+    def subscribe(self, event_type: str, task_id: str = "") -> asyncio.Queue:
+        """订阅某类事件。
+
+        task_id 为空串表示订阅所有任务的事件；非空时只收该任务的事件。
+        """
         q: asyncio.Queue = asyncio.Queue()
-        self._event_listeners[event_type].append(q)
+        self._event_listeners[event_type].append((task_id, q))
         return q
 
     def unsubscribe(self, event_type: str, queue: asyncio.Queue) -> None:
         """取消订阅"""
-        if queue in self._event_listeners.get(event_type, []):
-            self._event_listeners[event_type].remove(queue)
+        for item in self._event_listeners.get(event_type, []):
+            if item[1] is queue:
+                self._event_listeners[event_type].remove(item)
+                break

@@ -1,13 +1,16 @@
 """Agent 引擎 — 单 Agent 模式入口 + 多 Agent 系统初始化"""
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
+import logging
 
 from .message_bus import MessageBus
 from .messages import AgentRole, Message, MessageType
+from .task_context import TaskContext
 from .coder import CoderAgent
 from .reviewer import ReviewerAgent
 from .orchestrator import OrchestratorAgent
@@ -15,6 +18,9 @@ from ..config import KFZCodeConfig
 from ..llm.client import DeepV4Client
 from ..llm.types import LLMMessage, LLMResponse, FunctionCall, ToolCallDelta, ToolResult
 from ..tools.base import ToolRegistry
+
+
+logger = logging.getLogger(__name__)
 
 
 class KFZCodeEngine:
@@ -84,6 +90,7 @@ class KFZCodeEngine:
             max_iterations=self.config.orchestrator.max_iterations,
             auto_confirm_on_pass=self.config.orchestrator.auto_confirm_on_pass,
             review_timeout=self.config.orchestrator.review_timeout,
+            rollback_callback=self.rollback_task,
         )
 
         # 启动消息循环
@@ -101,6 +108,9 @@ class KFZCodeEngine:
 
     async def submit_task(self, description: str, task_id: str = "", session_id: str = "") -> str:
         """提交用户任务，返回 task_id"""
+        # task_id 为空时生成唯一 id（Message 的 default_factory 只在缺省时生效，显式传空串会覆盖）
+        if not task_id:
+            task_id = uuid.uuid4().hex[:12]
         msg = Message(
             type=MessageType.TASK_ASSIGN,
             from_agent=AgentRole.ORCHESTRATOR,
@@ -108,12 +118,152 @@ class KFZCodeEngine:
             task_id=task_id,
             payload={"description": description, "session_id": session_id},
         )
+        # 注册任务上下文（per-task 状态隔离：取消标志、HITL 等待各任务独立）
+        ctx = self.bus.register_task(task_id, session_id)
+        # 记录 git 基线（供取消时回滚 shell 改动兜底）
+        await self._capture_git_baseline(ctx)
         await self.bus.send(msg)
-        return msg.task_id
+        return task_id
 
-    def get_event_queue(self) -> asyncio.Queue:
-        """获取事件队列（供 SSE/WebSocket 桥接使用）"""
-        return self.bus.subscribe("progress")
+    def get_event_queue(self, task_id: str = "") -> asyncio.Queue:
+        """获取事件队列（按 task_id 过滤，供 SSE 桥接使用）"""
+        return self.bus.subscribe("progress", task_id)
+
+    def respond_user(self, task_id: str, data: dict) -> None:
+        """接收用户回复（多 Agent 模式的 ask_user 闭环）
+
+        由 HTTP 端点 POST /api/chat/respond 调用，唤醒指定任务中等待用户回复的 Agent。
+        """
+        ctx = self.bus.get_task_context(task_id)
+        if ctx:
+            ctx.respond_user(data)
+
+    def cancel_task(self, task_id: str) -> None:
+        """取消指定多 Agent 任务（中途取消）
+
+        由 HTTP 端点 POST /api/chat/cancel 调用。
+        设置该任务的取消标志并唤醒其正在等待用户回复的 Agent。
+        """
+        ctx = self.bus.get_task_context(task_id)
+        if ctx:
+            ctx.cancel()
+
+    async def _capture_git_baseline(self, ctx) -> None:
+        """记录任务开始时的 git 基线（HEAD + 已有 dirty 文件），用于回滚兜底。
+
+        非 git 仓库或 git 不可用时静默降级为「纯文件备份回滚」。
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                ctx.git_head = stdout.decode(errors="replace").strip()
+
+            proc2 = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout2, _ = await proc2.communicate()
+            if proc2.returncode == 0:
+                dirty: set[str] = set()
+                for line in stdout2.decode(errors="replace").splitlines():
+                    if line.strip():
+                        dirty.add(line[3:].strip())  # porcelain: "XY path"
+                ctx.git_dirty_before = dirty
+        except Exception:
+            pass
+
+    async def rollback_task(self, task_id: str) -> None:
+        """回滚指定任务已做的文件修改（取消/异常时调用）。
+
+        顺序：先精确恢复文件工具备份，再删除新建文件，最后 git 兜底 shell 改动。
+        """
+        ctx = self.bus.get_task_context(task_id)
+        if not ctx:
+            return
+
+        # 1. 恢复被文件工具修改过的文件
+        for path, content in ctx.file_backups.items():
+            try:
+                Path(path).write_bytes(content)
+            except Exception:
+                pass
+
+        # 2. 删除本任务新建的文件
+        for path in ctx.created_files:
+            try:
+                p = Path(path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+        # 3. git 兜底 shell 造成的改动
+        if ctx.shell_used and ctx.git_head:
+            await self._git_rollback(ctx)
+
+    async def _git_rollback(self, ctx) -> None:
+        """用 git 兜底回滚 shell 命令造成的文件改动（排除任务前用户已有的 dirty）。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return
+
+            dirty_now: set[str] = set()
+            untracked: set[str] = set()
+            for line in stdout.decode(errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                status = line[:2].strip()
+                path = line[3:].strip()
+                if status == "??":
+                    untracked.add(path)
+                else:
+                    dirty_now.add(path)
+
+            # 文件工具已精确处理过的文件（相对 workspace 路径），git 兜底跳过它们
+            workspace_path = Path(self.workspace).resolve()
+            handled: set[str] = set()
+            for p in list(ctx.file_backups.keys()) + list(ctx.created_files):
+                try:
+                    rel = Path(p).resolve().relative_to(workspace_path)
+                    handled.add(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
+
+            # 任务期间新改动 = 当前 dirty - 任务前 dirty - 文件工具已处理
+            changed_by_task = dirty_now - ctx.git_dirty_before - handled
+            new_untracked = untracked - ctx.git_dirty_before - handled
+
+            # 恢复修改/删除的已跟踪文件
+            for f in changed_by_task:
+                proc_r = await asyncio.create_subprocess_exec(
+                    "git", "checkout", "--", f,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    cwd=self.workspace,
+                )
+                await proc_r.communicate()
+
+            # 删除任务期间新增的 untracked 文件
+            for f in new_untracked:
+                try:
+                    p = Path(self.workspace) / f
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def health_check(self) -> dict:
         """健康检查"""
@@ -157,6 +307,9 @@ class SingleAgentRunner:
         self._user_response_event: asyncio.Event | None = None
         self._user_response_data: dict = {}
         self._ask_user_timeout_count = 0  # ask_user 连续超时计数
+
+        # 回滚追踪：单 Agent 也支持取消时回滚本任务的文件修改
+        self.task_ctx = TaskContext(task_id=session_id or "single", session_id=session_id)
 
         # 集成上下文管理器
         from ..agent.context import ContextManager, repair_message_history
@@ -312,6 +465,131 @@ class SingleAgentRunner:
         if self._user_response_event is not None:
             self._user_response_event.set()
 
+    # ===== 回滚追踪（单 Agent 取消时回滚本任务的文件修改） =====
+
+    def _track_rollback(self, tool_name: str, tool, args: dict) -> None:
+        """工具执行前的回滚追踪（写文件备份原内容、shell 标记）。"""
+        if tool_name in ("write_file", "edit_file"):
+            file_path = args.get("file_path", "")
+            if not file_path:
+                return
+            path = Path(file_path)
+            if not path.is_absolute():
+                ws_root = getattr(tool, "workspace_root", None) or Path(self.workspace)
+                path = ws_root / path
+            path = path.resolve()
+            key = str(path)
+            if path.exists():
+                try:
+                    self.task_ctx.backup_file(key, path.read_bytes())
+                except Exception:
+                    pass
+            else:
+                self.task_ctx.mark_created(key)
+        elif tool_name == "execute_command":
+            self.task_ctx.mark_shell_used()
+
+    async def _capture_git_baseline(self) -> None:
+        """记录本次对话开始时的 git 基线（HEAD + 已有 dirty），用于回滚兜底。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                self.task_ctx.git_head = stdout.decode(errors="replace").strip()
+
+            proc2 = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout2, _ = await proc2.communicate()
+            if proc2.returncode == 0:
+                dirty: set[str] = set()
+                for line in stdout2.decode(errors="replace").splitlines():
+                    if line.strip():
+                        dirty.add(line[3:].strip())
+                self.task_ctx.git_dirty_before = dirty
+        except Exception:
+            pass
+
+    async def _rollback(self) -> None:
+        """回滚本次对话已做的文件修改（取消时调用）。"""
+        # 1. 恢复文件工具备份
+        for path, content in self.task_ctx.file_backups.items():
+            try:
+                Path(path).write_bytes(content)
+            except Exception:
+                pass
+        # 2. 删除新建文件
+        for path in self.task_ctx.created_files:
+            try:
+                p = Path(path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+        # 3. git 兜底 shell 改动
+        if self.task_ctx.shell_used and self.task_ctx.git_head:
+            await self._git_rollback()
+
+    async def _git_rollback(self) -> None:
+        """git 兜底回滚 shell 改动（排除对话前已有的 dirty）。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=self.workspace,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return
+
+            dirty_now: set[str] = set()
+            untracked: set[str] = set()
+            for line in stdout.decode(errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                status = line[:2].strip()
+                path = line[3:].strip()
+                if status == "??":
+                    untracked.add(path)
+                else:
+                    dirty_now.add(path)
+
+            workspace_path = Path(self.workspace).resolve()
+            handled: set[str] = set()
+            for p in list(self.task_ctx.file_backups.keys()) + list(self.task_ctx.created_files):
+                try:
+                    rel = Path(p).resolve().relative_to(workspace_path)
+                    handled.add(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
+
+            changed_by_task = dirty_now - self.task_ctx.git_dirty_before - handled
+            new_untracked = untracked - self.task_ctx.git_dirty_before - handled
+
+            for f in changed_by_task:
+                proc_r = await asyncio.create_subprocess_exec(
+                    "git", "checkout", "--", f,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    cwd=self.workspace,
+                )
+                await proc_r.communicate()
+
+            for f in new_untracked:
+                try:
+                    p = Path(self.workspace) / f
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ===== 主循环 =====
 
     async def run(self, user_message: str, image_paths: list[str] | None = None):
@@ -430,6 +708,9 @@ class SingleAgentRunner:
         # 每次新消息开始时清除上次的取消标志和超时计数
         self._cancel_event.clear()
         self._ask_user_timeout_count = 0
+        # 重置回滚追踪，记录 git 基线（供取消时回滚）
+        self.task_ctx.clear_backups()
+        await self._capture_git_baseline()
 
         # ---- <thinking> 标签流式检测状态 ----
         TAG_OPEN = "<thinking>"
@@ -484,6 +765,8 @@ class SingleAgentRunner:
             if self._cancel_event.is_set():
                 yield {"type": "message", "content": "\n⏹ 任务已被用户取消。\n"}
                 final_status = "cancelled"
+                # 回滚本任务已做的文件修改
+                await self._rollback()
                 break
 
             # ---- 防御: 每次 LLM 调用前修复 tool_calls 配对 ----
@@ -497,6 +780,7 @@ class SingleAgentRunner:
             turn_reasoning = ""  # 当前轮次的推理内容（每次重试会重置）
             response = LLMResponse()
             tool_deltas: dict[int, ToolCallDelta] = {}
+            reported_error = False  # 是否已在异常分支中向用户报告过具体错误
             for retry_attempt in range(ADAPTIVE_MAX_RETRIES + 1):
                 try:
                     # 构建消息列表（重试时可能截断历史）
@@ -576,8 +860,10 @@ class SingleAgentRunner:
                         await asyncio.sleep(wait)
                         continue
                     else:
+                        logger.error(f"LLM API 错误 HTTP {status}: {error_body}")
                         yield {"type": "error", "error": f"API 错误 HTTP {status}: {error_body}"}
                         final_status = "failed"
+                        reported_error = True
                         break
 
                 except OSError as e:
@@ -612,6 +898,7 @@ class SingleAgentRunner:
                     else:
                         yield {"type": "error", "error": f"API 错误: {e}"}
                     final_status = "failed"
+                    reported_error = True
                     break
 
                 except (httpx.ConnectError, httpx.ReadError,
@@ -626,21 +913,25 @@ class SingleAgentRunner:
                     else:
                         yield {"type": "error", "error": f"网络连接失败(已重试{ADAPTIVE_MAX_RETRIES}次): {type(e).__name__}"}
                         final_status = "failed"
+                        reported_error = True
                         break
 
                 except Exception as e:
                     self.llm.max_tokens = current_max_tokens
+                    logger.exception(f"LLM 调用未知异常: {e}")
                     if retry_attempt < ADAPTIVE_MAX_RETRIES:
-                        yield {"type": "message", "content": f"\n[系统] 异常({type(e).__name__})，调整参数自适应重试 (attempt {retry_attempt + 1})...\n"}
+                        yield {"type": "message", "content": f"\n[系统] 异常({type(e).__name__}): {e}，调整参数自适应重试 (attempt {retry_attempt + 1})...\n"}
                         await asyncio.sleep(1)
                         continue
                     else:
-                        yield {"type": "error", "error": f"对话异常(已重试{ADAPTIVE_MAX_RETRIES}次): {type(e).__name__}"}
+                        yield {"type": "error", "error": f"对话异常(已重试{ADAPTIVE_MAX_RETRIES}次): {type(e).__name__}: {e}"}
                         final_status = "failed"
+                        reported_error = True
                         break
 
-            # 如果重试全部失败（无内容），跳到 done
-            if not response.content and not response.tool_calls and not response.reasoning_content:
+            # 如果重试全部失败（无内容），且尚未报告过具体错误，跳到 done
+            if (not reported_error and not response.content
+                    and not response.tool_calls and not response.reasoning_content):
                 yield {"type": "error", "error": (
                     f"LLM 请求多次重试后仍失败 (已重试{ADAPTIVE_MAX_RETRIES}次)。"
                     "请检查网络连接、API 配置或降低任务复杂度后重试。"
@@ -796,6 +1087,9 @@ class SingleAgentRunner:
                 # ==== 正常执行工具 ====
                 yield {"type": "tool_call", "name": tc.name, "arguments": tc.arguments}
 
+                # 回滚追踪：写文件前备份原内容、shell 命令标记
+                self._track_rollback(tc.name, tool, args)
+
                 tool_result: ToolResult
                 if tool:
                     try:
@@ -899,6 +1193,9 @@ class SingleAgentRunner:
         
         # 保存历史记录到持久化存储
         self._save_history()
+
+        # 任务结束（成功/失败/超时等非取消结局）：丢弃备份，不回滚
+        self.task_ctx.clear_backups()
 
     async def close(self) -> None:
         # 保存历史记录到持久化存储
