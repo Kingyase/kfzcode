@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 
-const VERSION = '0.1.0';
+const VERSION = '1.0.1';
 
 // ===== 全局异常防护 =====
 // 未捕获的 Promise rejection / 异常不应静默杀死进程，

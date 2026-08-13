@@ -1,6 +1,6 @@
 [project]
 name = "kfzcode"
-version = "0.1.0"
+version = "1.0.1"
 description = "KFZCode - 内网 AI 编程助手后端"
 requires-python = ">=3.10"
 dependencies = [

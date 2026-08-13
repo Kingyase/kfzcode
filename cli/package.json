@@ -1,6 +1,6 @@
 {
   "name": "kfzcode-cli",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "description": "KFZCode CLI - 内网 AI 编程助手终端",
   "main": "dist/index.js",
   "bin": {

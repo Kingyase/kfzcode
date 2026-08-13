@@ -49,7 +49,7 @@ const config_1 = require("./config");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const readline = __importStar(require("readline"));
-const VERSION = '0.1.0';
+const VERSION = '1.0.1';
 // ===== 全局异常防护 =====
 // 未捕获的 Promise rejection / 异常不应静默杀死进程，
 // 记录日志后让用户有机会看到错误信息而非直接闪退。
